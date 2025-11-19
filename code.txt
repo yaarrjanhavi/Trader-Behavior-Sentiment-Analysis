@@ -1,0 +1,130 @@
+import pandas as pd
+import numpy as np
+from scipy import stats
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+pd.set_option('display.max_columns', None)
+sns.set_style('whitegrid')
+
+TRADER_DATA_PATH = 'historical_data.csv'  
+SENTIMENT_DATA_PATH = 'fear_greed_index.csv'
+
+try:
+    df_trader = pd.read_csv(TRADER_DATA_PATH)
+    df_sentiment = pd.read_csv(SENTIMENT_DATA_PATH)
+    print("Data loaded successfully.")
+except FileNotFoundError:
+    print("ERROR: Please ensure the files are downloaded and paths are correct.")
+
+print("\n--- Trader Data Info ---")
+df_trader.info()
+print("\n--- Sentiment Data Info ---")
+df_sentiment.info()
+
+#Data cleaning and preprocessing
+
+df_trader['Trade_Time'] = pd.to_datetime(df_trader['Timestamp'], unit='ms') 
+df_trader['Trade_Date'] = df_trader['Trade_Time'].dt.date
+
+
+financial_cols = ['Execution Price', 'Size USD', 'Closed PnL', 'Fee']
+for col in financial_cols:
+    df_trader[col] = pd.to_numeric(df_trader[col], errors='coerce')
+
+df_trader.dropna(subset=['Closed PnL'], inplace=True)
+
+
+df_sentiment['Sentiment_Date'] = pd.to_datetime(df_sentiment['date'])
+df_sentiment['Sentiment_Date'] = df_sentiment['Sentiment_Date'].dt.date
+
+df_sentiment['value'] = pd.to_numeric(df_sentiment['value'], errors='coerce')
+
+df_sentiment['classification'] = df_sentiment['classification'].str.title()
+
+df_sentiment_clean = df_sentiment[['Sentiment_Date', 'value', 'classification']].copy()
+df_sentiment_clean.drop_duplicates(subset=['Sentiment_Date'], inplace=True)
+
+print("\nData cleaning complete.")
+
+#Data integration
+
+df_merged = pd.merge(
+    df_trader,
+    df_sentiment_clean,
+    left_on='Trade_Date',
+    right_on='Sentiment_Date',
+    how='left'
+)
+
+print(f"\nTotal Trades: {len(df_trader)}")
+print(f"Trades matched to Sentiment: {len(df_merged.dropna(subset=['classification']))}")
+
+df_analysis = df_merged.dropna(subset=['classification']).copy()
+
+print("\nData merging complete. Ready for analysis.")
+df_analysis.head()
+
+#Analysis: performance by sentiment
+sentiment_performance = df_analysis.groupby('classification').agg(
+    Total_PnL=('Closed PnL', 'sum'),
+    Mean_PnL=('Closed PnL', 'mean'),
+    Median_PnL=('Closed PnL', 'median'),
+    Total_Trades=('Closed PnL', 'count'),
+    Mean_Trade_Size_USD=('Size USD', 'mean')
+).reset_index()
+
+def calculate_win_rate(group):
+    winning_trades = (group['Closed PnL'] > 0).sum()
+    total_trades = len(group)
+    return winning_trades / total_trades if total_trades > 0 else 0
+
+win_rate_series = df_analysis.groupby('classification').apply(calculate_win_rate).rename('Win_Rate')
+sentiment_performance = sentiment_performance.merge(win_rate_series, on='classification').round(4)
+
+print("\n--- Performance Metrics by Sentiment Classification ---")
+print(sentiment_performance)
+
+
+pnl_fear = df_analysis[df_analysis['classification'] == 'Fear']['Closed PnL']
+pnl_greed = df_analysis[df_analysis['classification'] == 'Greed']['Closed PnL']
+
+t_stat, p_value = stats.ttest_ind(pnl_fear, pnl_greed, equal_var=False, nan_policy='omit')
+
+print("\n--- T-Test: Mean PnL (Fear vs. Greed) ---")
+print(f"T-Statistic: {t_stat:.4f}")
+print(f"P-Value: {p_value:.4f}")
+if p_value < 0.05:
+    print("Conclusion: The difference in mean PnL between Fear and Greed days is **statistically significant** (p < 0.05).")
+else:
+    print("Conclusion: The difference in mean PnL is **not statistically significant** (p > 0.05).")
+
+#Visualization
+plt.figure(figsize=(10, 6))
+sns.boxplot(x='classification', y='Closed PnL', data=df_analysis, showfliers=False) # showfliers=False removes extreme outliers
+plt.title('Distribution of Closed PnL by Market Sentiment')
+plt.xlabel('Market Sentiment Classification')
+plt.ylabel('Closed PnL (Excluding Extreme Outliers)')
+plt.show()
+
+
+trader_total_pnl = df_analysis.groupby('Account')['Closed PnL'].sum().sort_values(ascending=False)
+TOP_N_PERCENT = 0.10
+top_n = int(len(trader_total_pnl) * TOP_N_PERCENT)
+
+successful_traders = trader_total_pnl.head(top_n).index
+
+df_successful = df_analysis[df_analysis['Account'].isin(successful_traders)]
+
+successful_sentiment_side = df_successful.groupby(['classification', 'Side']).agg(
+    Count=('Trade ID', 'count')
+).reset_index()
+
+successful_behavior = successful_sentiment_side.pivot(index='classification', columns='Side', values='Count')
+successful_behavior['Total'] = successful_behavior.sum(axis=1)
+successful_behavior['Buy_Ratio'] = successful_behavior['BUY'] / successful_behavior['Total']
+successful_behavior['Sell_Ratio'] = successful_behavior['SELL'] / successful_behavior['Total']
+
+print("\n--- Successful Traders' (Top 10%) Behavior by Sentiment ---")
+print("Ratio of BUY vs. SELL trades:")
+print(successful_behavior[['Buy_Ratio', 'Sell_Ratio']].round(4))
